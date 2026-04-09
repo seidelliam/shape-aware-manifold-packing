@@ -80,13 +80,23 @@ if __name__ == '__main__':
     if config.INFO["num_nodes"]*config.INFO["gpus_per_node"] > 1:
         ssl_model.backbone = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ssl_model.backbone)
     ssl_dir = os.path.join(config.loc,"ssl")
-    last_ckpt = os.path.join(ssl_dir,'ssl-epoch={:d}.ckpt'.format(config.SSL["n_epochs"]-1))
-    if os.path.isfile(last_ckpt):
-        print(f'Found pretrained model at {last_ckpt}, loading...')
-        ssl_model = lightning_models.CLAMP.load_from_checkpoint(last_ckpt)
+    # Resolve checkpoint: optional 3rd arg, or last epoch, or latest available
+    if len(sys.argv) >= 4 and os.path.isfile(sys.argv[3]):
+        ssl_ckpt = sys.argv[3]
+        print(f'Using specified checkpoint: {ssl_ckpt}')
+    elif os.path.isfile(os.path.join(ssl_dir,'ssl-epoch={:d}.ckpt'.format(config.SSL["n_epochs"]-1))):
+        ssl_ckpt = os.path.join(ssl_dir,'ssl-epoch={:d}.ckpt'.format(config.SSL["n_epochs"]-1))
+        print(f'Found pretrained model at {ssl_ckpt}, loading...')
     else:
-        print(f'Pretrained model at {last_ckpt} not found !')
-        raise Exception("Pretrained model not found") 
+        ckpt_files = lightning_models.get_top_n_latest_checkpoints(ssl_dir, 1)
+        if ckpt_files:
+            ssl_ckpt = ckpt_files[0]
+            print(f'Last epoch not found, using latest available checkpoint: {ssl_ckpt}')
+        else:
+            last_ckpt = os.path.join(ssl_dir,'ssl-epoch={:d}.ckpt'.format(config.SSL["n_epochs"]-1))
+            print(f'Pretrained model at {last_ckpt} not found!')
+            raise Exception("Pretrained model not found")
+    ssl_model = lightning_models.CLAMP.load_from_checkpoint(ssl_ckpt) 
     
     ###################################################
     # linear classification
@@ -124,10 +134,8 @@ if __name__ == '__main__':
             lc_lr = lr*config.LC["batch_size"]/256.0 # lr ~ 0.1
         elif config.LC["lr_scale"] == "sqrt":
             lc_lr = lr*math.sqrt(config.LC["batch_size"]) # lr ~ 0.05
-        # load the backbone form the latest checkpoint
-        # best_ssl_ckpt = os.path.join(ssl_dir,"best_val.ckpt")
-        latest_ssl_ckpt = lightning_models.get_top_n_latest_checkpoints(ssl_dir,1)[0]
-        ssl_model = lightning_models.CLAMP.load_from_checkpoint(latest_ssl_ckpt)
+        # load the backbone from the resolved checkpoint
+        ssl_model = lightning_models.CLAMP.load_from_checkpoint(ssl_ckpt)
         ssl_model.backbone.remove_projection_head()
         ssl_model.backbone = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ssl_model.backbone)  
         lc_model = lightning_models.LinearClassification(

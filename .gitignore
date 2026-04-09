@@ -1,0 +1,16 @@
+# Datasets
+datasets/
+
+# Training checkpoints and logs
+examples/*/ssl/
+examples/*/lc/
+examples/*/semi_sl/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

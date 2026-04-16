@@ -227,6 +227,65 @@ class GradientAttenuator(torch.autograd.Function):
 
 
 # ---------------------------------------------------------------------------
+# Vectorized helper: pairwise Mahalanobis distances (no Python loops)
+#
+# For each pair (i,j), the combined scatter matrix is Λi+Λj = [Xi;Xj]^T[Xi;Xj]
+# where Xi = preds_T[i] * scale (shape [V,O]).  The squared Mahalanobis distance
+# is  d²_ij = proj_ij^T  (gram_ij)^{-1}  proj_ij
+# where  gram_ij = [Xi;Xj][Xi;Xj]^T  (2V×2V)  and  proj_ij = [Xi;Xj](ci-cj).
+# All operations are batched over B² pairs using torch.linalg.solve.
+# ---------------------------------------------------------------------------
+def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
+    """Fully-vectorized pairwise Mahalanobis distance matrix.
+
+    Args:
+        centers:  [B, O] cluster centroids
+        preds_T:  [B, V, O] zero-mean view embeddings per cluster
+        scale:    float, typically 1/sqrt(V-1)
+        reg:      diagonal regularization added to each gram matrix
+    Returns:
+        dist_matrix: [B, B] symmetric distance matrix
+    """
+    B, V, O = preds_T.shape
+    device = centers.device
+    dtype = centers.dtype
+
+    X = preds_T * scale  # [B, V, O]
+
+    # All pairwise gram sub-blocks via a single flat matmul [B*V, O] @ [O, B*V]
+    X_flat = X.reshape(B * V, O)
+    cross_flat = X_flat @ X_flat.T                               # [B*V, B*V]
+    # Reshape to [B, B, V, V]:  cross[i,j,k,l] = sum_d X[i,k,d]*X[j,l,d]
+    cross = cross_flat.reshape(B, V, B, V).permute(0, 2, 1, 3)  # [B, B, V, V]
+    # Per-cluster self-grams: gram_self[i] = cross[i,i]
+    gram_self = cross.diagonal(dim1=0, dim2=1).permute(2, 0, 1) # [B, V, V]
+
+    # Assemble 2V×2V block gram for every pair: [[Gi, Gij],[Gij^T, Gj]]
+    gram_i   = gram_self[:, None].expand(B, B, V, V)            # [B, B, V, V]
+    gram_j   = gram_self[None, :].expand(B, B, V, V)            # [B, B, V, V]
+    gram_top = torch.cat([gram_i,                  cross       ], dim=3)  # [B, B, V, 2V]
+    gram_bot = torch.cat([cross.transpose(-1, -2), gram_j      ], dim=3)  # [B, B, V, 2V]
+    gram_full = torch.cat([gram_top, gram_bot], dim=2)           # [B, B, 2V, 2V]
+    gram_full = gram_full + reg * torch.eye(2 * V, device=device, dtype=dtype)
+
+    # Pairwise center differences and their projections onto each cluster's views
+    diff     = centers[:, None] - centers[None, :]               # [B, B, O]
+    proj_top = torch.einsum('ivd,ijd->ijv', X, diff)             # [B, B, V]
+    proj_bot = torch.einsum('jvd,ijd->ijv', X, diff)             # [B, B, V]
+    proj_full = torch.cat([proj_top, proj_bot], dim=2)           # [B, B, 2V]
+
+    # Batched solve: gram_full @ u = proj_full  (B² independent 2V×2V systems)
+    u = torch.linalg.solve(
+        gram_full.reshape(B * B, 2 * V, 2 * V),
+        proj_full.reshape(B * B, 2 * V, 1)
+    ).reshape(B, B, 2 * V)                                       # [B, B, 2V]
+
+    # d²[i,j] = proj · u
+    d2 = (proj_full * u).sum(dim=-1)                             # [B, B]
+    return torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12)         # [B, B]
+
+
+# ---------------------------------------------------------------------------
 # Extension 1 (standalone): Anisotropic Overlap Detection
 # Replaces Euclidean centroid distance with Mahalanobis distance using the
 # low-rank pseudoinverse of (Lambda_i + Lambda_j).
@@ -238,9 +297,7 @@ class AnisotropicLogRepulsiveEllipsoidPackingLoss(LogRepulsiveEllipsoidPackingLo
     only overrides the distance computation: Euclidean ||ci - cj|| is replaced
     by the Mahalanobis distance sqrt((ci-cj)^T (Li+Lj)^+ (ci-cj)) where
     Li = (1/(V-1)) * Xi^T Xi is the scatter matrix of cluster i (rank <= V << O).
-
-    Falls back gracefully to the Euclidean distance when both scatter matrices
-    are degenerate (zero trace), preserving numerical stability.
+    All pairwise distances are computed in a single batched GPU operation.
     """
 
     def __call__(self, preds, labels):
@@ -256,59 +313,21 @@ class AnisotropicLogRepulsiveEllipsoidPackingLoss(LogRepulsiveEllipsoidPackingLo
             preds = preds_local
             ws = 1
 
-        # preds: [V, B*ws, O]
         com = torch.mean(preds, dim=(0, 1))
         preds -= com
         preds = torch.nn.functional.normalize(preds, dim=-1)
         centers = torch.mean(preds, dim=0)   # [B*ws, O]
-        preds -= centers                      # zero-mean per cluster
+        preds -= centers
 
         traces = torch.sum(torch.permute(preds, (1, 0, 2)) ** 2, dim=(1, 2)) / (self.n_views - 1.0)
         radii = self.rs * torch.sqrt(traces / min(preds.shape[-1], self.n_views) + 1e-12)
 
-        # ---- Mahalanobis distance computation --------------------------------
         B_total = self.batch_size * ws
-        O = preds.shape[-1]
         V = self.n_views
         scale = 1.0 / _math.sqrt(max(V - 1, 1))
-
-        # preds_T: [B_total, V, O]  — each row is one cluster's view matrix
         preds_T = preds.permute(1, 0, 2)  # [B_total, V, O]
 
-        dist_matrix = torch.zeros(B_total, B_total, device=preds.device, dtype=preds.dtype)
-        for i in range(B_total):
-            for j in range(i + 1, B_total):
-                # Combined data matrix for cluster pair (i, j): shape [2V, O]
-                data_ij = torch.cat([preds_T[i], preds_T[j]], dim=0) * scale
-                diff_ij = centers[i] - centers[j]  # [O]
-                # Mahalanobis² = diff^T (Lambda_i + Lambda_j)^+ diff
-                # Since Lambda_i + Lambda_j = (scale * data_ij)^T (scale * data_ij),
-                # we have:  ||data_ij (data_ij^T data_ij)^{-1} data_ij^T diff||
-                # Equivalently: solve data_ij^T @ x = diff via lstsq, then
-                # d² = diff · x  (for the projection onto the column space).
-                # Use lstsq on the transposed system: data_ij^T @ x ≈ diff
-                try:
-                    result = torch.linalg.lstsq(
-                        data_ij.T.unsqueeze(0),
-                        diff_ij.unsqueeze(0).unsqueeze(-1)
-                    ).solution.squeeze()   # [O] or [2V]
-                    # The Mahalanobis distance in the column space of data_ij:
-                    # project diff onto the row space, then compute norm
-                    proj = data_ij @ diff_ij  # [2V]  = data_ij @ diff_ij
-                    # solve data_ij @ data_ij^T @ u = proj  (small [2V, 2V] system)
-                    gram = data_ij @ data_ij.T  # [2V, 2V]
-                    u = torch.linalg.lstsq(
-                        gram.unsqueeze(0),
-                        proj.unsqueeze(0).unsqueeze(-1)
-                    ).solution.squeeze()   # [2V]
-                    d2 = torch.dot(proj, u)
-                    d = torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12)
-                except Exception:
-                    # Fallback to Euclidean if lstsq fails
-                    d = torch.sqrt(torch.sum((centers[i] - centers[j]) ** 2) + 1e-12)
-                dist_matrix[i, j] = d
-                dist_matrix[j, i] = d
-        # -----------------------------------------------------------------------
+        dist_matrix = _mahalanobis_dist_matrix(centers, preds_T, scale)
 
         sum_radii = radii[None, :] + radii[:, None] + 1e-6
         sum_radii = torch.min(sum_radii, self.max_range * torch.ones_like(sum_radii, device=sum_radii.device))
@@ -332,7 +351,7 @@ class SAMPLoss(AnisotropicLogRepulsiveEllipsoidPackingLoss):
     """Shape-Aware Manifold Packing loss.
 
     Combines:
-      1. Anisotropic overlap detection (Mahalanobis distance, from parent class)
+      1. Anisotropic overlap detection (Mahalanobis distance)
       2. Asymmetric orientation-aware repulsion (gamma gradient attenuation)
 
     gamma in [0, 1]:
@@ -375,34 +394,14 @@ class SAMPLoss(AnisotropicLogRepulsiveEllipsoidPackingLoss):
         scale = 1.0 / _math.sqrt(max(V - 1, 1))
         preds_T = preds.permute(1, 0, 2)  # [B_total, V, O]
 
-        # --- Compute per-cluster principal directions via batched SVD -----------
-        # Economy SVD: preds_T[i] has shape [V, O] → Vh shape [V, O]
-        _, _, Vh = torch.linalg.svd(preds_T, full_matrices=False)  # [B_total, V, O]
+        # Batched SVD for per-cluster principal directions: [B_total, V, O]
+        _, _, Vh = torch.linalg.svd(preds_T, full_matrices=False)
         eigvecs = Vh.permute(0, 2, 1)  # [B_total, O, V]
 
-        # Apply gradient attenuation to centers (identity in forward, modifies backward)
+        # Apply gradient attenuation to centers (identity forward, attenuates backward)
         centers_att = GradientAttenuator.apply(centers, eigvecs, self.gamma)
 
-        # --- Mahalanobis distance (same as parent class) ----------------------
-        dist_matrix = torch.zeros(B_total, B_total, device=preds.device, dtype=preds.dtype)
-        for i in range(B_total):
-            for j in range(i + 1, B_total):
-                data_ij = torch.cat([preds_T[i], preds_T[j]], dim=0) * scale
-                diff_ij = centers_att[i] - centers_att[j]
-                try:
-                    proj = data_ij @ diff_ij
-                    gram = data_ij @ data_ij.T
-                    u = torch.linalg.lstsq(
-                        gram.unsqueeze(0),
-                        proj.unsqueeze(0).unsqueeze(-1)
-                    ).solution.squeeze()
-                    d2 = torch.dot(proj, u)
-                    d = torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12)
-                except Exception:
-                    d = torch.sqrt(torch.sum((centers_att[i] - centers_att[j]) ** 2) + 1e-12)
-                dist_matrix[i, j] = d
-                dist_matrix[j, i] = d
-        # -----------------------------------------------------------------------
+        dist_matrix = _mahalanobis_dist_matrix(centers_att, preds_T, scale)
 
         sum_radii = radii[None, :] + radii[:, None] + 1e-6
         sum_radii = torch.min(sum_radii, self.max_range * torch.ones_like(sum_radii, device=sum_radii.device))

@@ -250,7 +250,9 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     device = centers.device
     dtype = centers.dtype
 
-    X = preds_T * scale  # [B, V, O]
+    # Cast to float32: linalg.solve is numerically unstable in fp16/bf16
+    X = preds_T.float() * float(scale)  # [B, V, O]
+    centers_f = centers.float()         # [B, O]
 
     # All pairwise gram sub-blocks via a single flat matmul [B*V, O] @ [O, B*V]
     X_flat = X.reshape(B * V, O)
@@ -266,10 +268,10 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     gram_top = torch.cat([gram_i,                  cross       ], dim=3)  # [B, B, V, 2V]
     gram_bot = torch.cat([cross.transpose(-1, -2), gram_j      ], dim=3)  # [B, B, V, 2V]
     gram_full = torch.cat([gram_top, gram_bot], dim=2)           # [B, B, 2V, 2V]
-    gram_full = gram_full + reg * torch.eye(2 * V, device=device, dtype=dtype)
+    gram_full = gram_full + reg * torch.eye(2 * V, device=device, dtype=torch.float32)
 
     # Pairwise center differences and their projections onto each cluster's views
-    diff     = centers[:, None] - centers[None, :]               # [B, B, O]
+    diff     = centers_f[:, None] - centers_f[None, :]           # [B, B, O]
     proj_top = torch.einsum('ivd,ijd->ijv', X, diff)             # [B, B, V]
     proj_bot = torch.einsum('jvd,ijd->ijv', X, diff)             # [B, B, V]
     proj_full = torch.cat([proj_top, proj_bot], dim=2)           # [B, B, 2V]
@@ -280,9 +282,9 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
         proj_full.reshape(B * B, 2 * V, 1)
     ).reshape(B, B, 2 * V)                                       # [B, B, 2V]
 
-    # d²[i,j] = proj · u
+    # d²[i,j] = proj · u  — cast result back to original dtype
     d2 = (proj_full * u).sum(dim=-1)                             # [B, B]
-    return torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12)         # [B, B]
+    return torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12).to(dtype)  # [B, B]
 
 
 # ---------------------------------------------------------------------------

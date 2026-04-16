@@ -83,11 +83,17 @@ class CLAMP(pl.LightningModule):
                  optim_name:str,scheduler_name:str,lr:float,momentum:float,weight_decay:float,eta:float,
                  warmup_epochs:int,n_epochs:int,exclude_bn_bias_from_weight_decay:bool=True,
                  n_views:int=4,batch_size:int=256,lw0:float=0.0,lw1:float=1.0,lw2:float=0.0,
-                 rs:float=2.0,pot_pow:float=2.0):
+                 rs:float=2.0,pot_pow:float=2.0,gamma:float=1.0):
         super().__init__()
         self.backbone = models.BackboneNet(backbone_name,prune,use_projection_head,proj_dim,proj_out_dim)
         if loss_name == "LogRepulsiveEllipsoidPackingLossUnitNorm":
             self.loss_fn = loss_module.LogRepulsiveEllipsoidPackingLossUnitNorm(n_views,batch_size,lw0,lw1,rs,pot_pow)
+            print("lw2 is dummy for " + loss_name)
+        elif loss_name == "AnisotropicLogRepulsiveEllipsoidPackingLoss":
+            self.loss_fn = loss_module.AnisotropicLogRepulsiveEllipsoidPackingLoss(n_views,batch_size,lw0,lw1,rs,pot_pow)
+            print("lw2 is dummy for " + loss_name)
+        elif loss_name == "SAMPLoss":
+            self.loss_fn = loss_module.SAMPLoss(n_views,batch_size,lw0,lw1,rs,pot_pow,gamma=gamma)
             print("lw2 is dummy for " + loss_name)
         elif loss_name == "MMCR_Loss":
             self.loss_fn = loss_module.MMCR_Loss(n_views,batch_size)

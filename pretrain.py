@@ -80,7 +80,8 @@ if __name__ == '__main__':
                                   lw1 = config.SSL["lw1"],
                                   lw2 = config.SSL["lw2"],
                                   pot_pow = config.SSL["pot_pow"],
-                                  rs = config.SSL["rs"])
+                                  rs = config.SSL["rs"],
+                                  gamma = config.SSL.get("gamma", 1.0))
     if config.INFO["num_nodes"]*config.INFO["gpus_per_node"] > 1:
         ssl_model.backbone = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ssl_model.backbone)
     ssl_dir = os.path.join(config.loc,"ssl")

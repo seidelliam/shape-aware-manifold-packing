@@ -168,8 +168,10 @@ class Config:
             "lw2":"float",
             "pot_pow":"float",
             "rs":"float",
+            # gamma for SAMPLoss orientation-aware repulsion (0=full attenuation, 1=no attenuation)
+            "gamma":"float",
             # tau is for info nce loss
-            "tau":"float", 
+            "tau":"float",
             "warmup_epochs":"int",
             "n_epochs":"int",
             "save_every_n_epochs":"int"

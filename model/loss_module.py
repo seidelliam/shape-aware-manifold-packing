@@ -194,3 +194,224 @@ class LogRepulsiveEllipsoidPackingLossUnitNorm:
         self.record["dist"] = dist_matrix[torch.logical_not(self_mask)].reshape((-1,)).detach()
         self.record["norm_center"] = torch.linalg.norm(centers,dim=-1).detach()
         return torch.log(ll + 1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Helper: custom autograd function that attenuates gradients along a set of
+# directions (eigenvectors of each cluster's scatter matrix) by factor gamma.
+# gamma=1.0 → no attenuation (recovers original CLAMP behaviour)
+# gamma=0.0 → fully removes gradient components along principal axes
+# ---------------------------------------------------------------------------
+class GradientAttenuator(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, centers, eigvecs, gamma):
+        # centers: [B, O]
+        # eigvecs: [B, O, k]  — top-k right singular vectors (row-wise) of each cluster's data matrix
+        # gamma:   scalar float in [0, 1]
+        ctx.save_for_backward(eigvecs)
+        ctx.gamma = gamma
+        return centers.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output: [B, O]
+        eigvecs, = ctx.saved_tensors  # [B, O, k]
+        gamma = ctx.gamma
+        # Projection coefficients onto each principal direction
+        proj = torch.einsum('bok,bo->bk', eigvecs, grad_output)  # [B, k]
+        # Reconstruct the principal component of the gradient
+        grad_principal = torch.einsum('bok,bk->bo', eigvecs, proj)  # [B, O]
+        # Attenuated gradient: keep full grad for off-axis directions, scale by gamma on-axis
+        grad_modified = grad_output - (1.0 - gamma) * grad_principal
+        return grad_modified, None, None  # no gradient for eigvecs or gamma
+
+
+# ---------------------------------------------------------------------------
+# Extension 1 (standalone): Anisotropic Overlap Detection
+# Replaces Euclidean centroid distance with Mahalanobis distance using the
+# low-rank pseudoinverse of (Lambda_i + Lambda_j).
+# ---------------------------------------------------------------------------
+class AnisotropicLogRepulsiveEllipsoidPackingLoss(LogRepulsiveEllipsoidPackingLossUnitNorm):
+    """Anisotropic overlap detection via Mahalanobis distance.
+
+    Inherits all behaviour from LogRepulsiveEllipsoidPackingLossUnitNorm and
+    only overrides the distance computation: Euclidean ||ci - cj|| is replaced
+    by the Mahalanobis distance sqrt((ci-cj)^T (Li+Lj)^+ (ci-cj)) where
+    Li = (1/(V-1)) * Xi^T Xi is the scatter matrix of cluster i (rank <= V << O).
+
+    Falls back gracefully to the Euclidean distance when both scatter matrices
+    are degenerate (zero trace), preserving numerical stability.
+    """
+
+    def __call__(self, preds, labels):
+        import math as _math
+        preds_local = torch.reshape(preds, (self.n_views, self.batch_size, preds.shape[-1]))
+        if dist.is_available() and dist.is_initialized():
+            ws = dist.get_world_size()
+            outputs = [torch.zeros_like(preds_local) for _ in range(ws)]
+            dist.all_gather(outputs, preds_local, async_op=False)
+            outputs[dist.get_rank()] = preds_local
+            preds = torch.cat(outputs, dim=1)
+        else:
+            preds = preds_local
+            ws = 1
+
+        # preds: [V, B*ws, O]
+        com = torch.mean(preds, dim=(0, 1))
+        preds -= com
+        preds = torch.nn.functional.normalize(preds, dim=-1)
+        centers = torch.mean(preds, dim=0)   # [B*ws, O]
+        preds -= centers                      # zero-mean per cluster
+
+        traces = torch.sum(torch.permute(preds, (1, 0, 2)) ** 2, dim=(1, 2)) / (self.n_views - 1.0)
+        radii = self.rs * torch.sqrt(traces / min(preds.shape[-1], self.n_views) + 1e-12)
+
+        # ---- Mahalanobis distance computation --------------------------------
+        B_total = self.batch_size * ws
+        O = preds.shape[-1]
+        V = self.n_views
+        scale = 1.0 / _math.sqrt(max(V - 1, 1))
+
+        # preds_T: [B_total, V, O]  — each row is one cluster's view matrix
+        preds_T = preds.permute(1, 0, 2)  # [B_total, V, O]
+
+        dist_matrix = torch.zeros(B_total, B_total, device=preds.device, dtype=preds.dtype)
+        for i in range(B_total):
+            for j in range(i + 1, B_total):
+                # Combined data matrix for cluster pair (i, j): shape [2V, O]
+                data_ij = torch.cat([preds_T[i], preds_T[j]], dim=0) * scale
+                diff_ij = centers[i] - centers[j]  # [O]
+                # Mahalanobis² = diff^T (Lambda_i + Lambda_j)^+ diff
+                # Since Lambda_i + Lambda_j = (scale * data_ij)^T (scale * data_ij),
+                # we have:  ||data_ij (data_ij^T data_ij)^{-1} data_ij^T diff||
+                # Equivalently: solve data_ij^T @ x = diff via lstsq, then
+                # d² = diff · x  (for the projection onto the column space).
+                # Use lstsq on the transposed system: data_ij^T @ x ≈ diff
+                try:
+                    result = torch.linalg.lstsq(
+                        data_ij.T.unsqueeze(0),
+                        diff_ij.unsqueeze(0).unsqueeze(-1)
+                    ).solution.squeeze()   # [O] or [2V]
+                    # The Mahalanobis distance in the column space of data_ij:
+                    # project diff onto the row space, then compute norm
+                    proj = data_ij @ diff_ij  # [2V]  = data_ij @ diff_ij
+                    # solve data_ij @ data_ij^T @ u = proj  (small [2V, 2V] system)
+                    gram = data_ij @ data_ij.T  # [2V, 2V]
+                    u = torch.linalg.lstsq(
+                        gram.unsqueeze(0),
+                        proj.unsqueeze(0).unsqueeze(-1)
+                    ).solution.squeeze()   # [2V]
+                    d2 = torch.dot(proj, u)
+                    d = torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12)
+                except Exception:
+                    # Fallback to Euclidean if lstsq fails
+                    d = torch.sqrt(torch.sum((centers[i] - centers[j]) ** 2) + 1e-12)
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d
+        # -----------------------------------------------------------------------
+
+        sum_radii = radii[None, :] + radii[:, None] + 1e-6
+        sum_radii = torch.min(sum_radii, self.max_range * torch.ones_like(sum_radii, device=sum_radii.device))
+        nbr_mask = torch.logical_and(dist_matrix < sum_radii, dist_matrix > self.min_margin)
+        self_mask = torch.eye(B_total, dtype=bool, device=preds.device)
+        mask = torch.logical_and(nbr_mask, torch.logical_not(self_mask))
+        ll = 0.5 * ((1.0 - dist_matrix[mask] / sum_radii[mask]) ** self.pot_pow).sum() * self.lw1
+        ll += self.lw0 * torch.sum(radii)
+        self.record["radii"] = radii.detach()
+        self.record["dist"] = dist_matrix[torch.logical_not(self_mask)].reshape((-1,)).detach()
+        self.record["norm_center"] = torch.linalg.norm(centers, dim=-1).detach()
+        return torch.log(ll + 1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Extension 2 (combined): Anisotropic Overlap + Orientation-Aware Repulsion
+# Adds gamma parameter on top of AnisotropicLogRepulsiveEllipsoidPackingLoss.
+# gamma=1.0 recovers anisotropic overlap without gradient attenuation.
+# ---------------------------------------------------------------------------
+class SAMPLoss(AnisotropicLogRepulsiveEllipsoidPackingLoss):
+    """Shape-Aware Manifold Packing loss.
+
+    Combines:
+      1. Anisotropic overlap detection (Mahalanobis distance, from parent class)
+      2. Asymmetric orientation-aware repulsion (gamma gradient attenuation)
+
+    gamma in [0, 1]:
+      gamma=1.0 → identical to AnisotropicLogRepulsiveEllipsoidPackingLoss
+      gamma=0.0 → gradient component along each cluster's principal axes zeroed
+    """
+
+    def __init__(self, n_views: int, batch_size: int, lw0: float = 1.0,
+                 lw1: float = 1.0, rs: float = 2.0, pot_pow: float = 2.0,
+                 min_margin: float = 1e-3, max_range: float = 1.5,
+                 gamma: float = 1.0):
+        super().__init__(n_views, batch_size, lw0, lw1, rs, pot_pow, min_margin, max_range)
+        self.gamma = gamma
+        self.hyper_parameters["gamma"] = gamma
+
+    def __call__(self, preds, labels):
+        import math as _math
+        preds_local = torch.reshape(preds, (self.n_views, self.batch_size, preds.shape[-1]))
+        if dist.is_available() and dist.is_initialized():
+            ws = dist.get_world_size()
+            outputs = [torch.zeros_like(preds_local) for _ in range(ws)]
+            dist.all_gather(outputs, preds_local, async_op=False)
+            outputs[dist.get_rank()] = preds_local
+            preds = torch.cat(outputs, dim=1)
+        else:
+            preds = preds_local
+            ws = 1
+
+        com = torch.mean(preds, dim=(0, 1))
+        preds -= com
+        preds = torch.nn.functional.normalize(preds, dim=-1)
+        centers = torch.mean(preds, dim=0)   # [B*ws, O]
+        preds -= centers
+
+        traces = torch.sum(torch.permute(preds, (1, 0, 2)) ** 2, dim=(1, 2)) / (self.n_views - 1.0)
+        radii = self.rs * torch.sqrt(traces / min(preds.shape[-1], self.n_views) + 1e-12)
+
+        B_total = self.batch_size * ws
+        V = self.n_views
+        scale = 1.0 / _math.sqrt(max(V - 1, 1))
+        preds_T = preds.permute(1, 0, 2)  # [B_total, V, O]
+
+        # --- Compute per-cluster principal directions via batched SVD -----------
+        # Economy SVD: preds_T[i] has shape [V, O] → Vh shape [V, O]
+        _, _, Vh = torch.linalg.svd(preds_T, full_matrices=False)  # [B_total, V, O]
+        eigvecs = Vh.permute(0, 2, 1)  # [B_total, O, V]
+
+        # Apply gradient attenuation to centers (identity in forward, modifies backward)
+        centers_att = GradientAttenuator.apply(centers, eigvecs, self.gamma)
+
+        # --- Mahalanobis distance (same as parent class) ----------------------
+        dist_matrix = torch.zeros(B_total, B_total, device=preds.device, dtype=preds.dtype)
+        for i in range(B_total):
+            for j in range(i + 1, B_total):
+                data_ij = torch.cat([preds_T[i], preds_T[j]], dim=0) * scale
+                diff_ij = centers_att[i] - centers_att[j]
+                try:
+                    proj = data_ij @ diff_ij
+                    gram = data_ij @ data_ij.T
+                    u = torch.linalg.lstsq(
+                        gram.unsqueeze(0),
+                        proj.unsqueeze(0).unsqueeze(-1)
+                    ).solution.squeeze()
+                    d2 = torch.dot(proj, u)
+                    d = torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12)
+                except Exception:
+                    d = torch.sqrt(torch.sum((centers_att[i] - centers_att[j]) ** 2) + 1e-12)
+                dist_matrix[i, j] = d
+                dist_matrix[j, i] = d
+        # -----------------------------------------------------------------------
+
+        sum_radii = radii[None, :] + radii[:, None] + 1e-6
+        sum_radii = torch.min(sum_radii, self.max_range * torch.ones_like(sum_radii, device=sum_radii.device))
+        nbr_mask = torch.logical_and(dist_matrix < sum_radii, dist_matrix > self.min_margin)
+        self_mask = torch.eye(B_total, dtype=bool, device=preds.device)
+        mask = torch.logical_and(nbr_mask, torch.logical_not(self_mask))
+        ll = 0.5 * ((1.0 - dist_matrix[mask] / sum_radii[mask]) ** self.pot_pow).sum() * self.lw1
+        ll += self.lw0 * torch.sum(radii)
+        self.record["radii"] = radii.detach()
+        self.record["dist"] = dist_matrix[torch.logical_not(self_mask)].reshape((-1,)).detach()
+        self.record["norm_center"] = torch.linalg.norm(centers, dim=-1).detach()
+        return torch.log(ll + 1e-6)

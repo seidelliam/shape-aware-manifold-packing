@@ -270,13 +270,11 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     gram_full = torch.cat([gram_top, gram_bot], dim=2)           # [B, B, 2V, 2V]
     gram_full = gram_full + reg * torch.eye(2 * V, device=device, dtype=torch.float32)
 
-    # Pairwise center-difference projections without materializing [B, B, O] diff.
-    # XC[i,j,v] = sum_d X[i,v,d] * c[j,d]  →  [B, B, V]
-    XC = torch.einsum('ivd,jd->ijv', X, centers_f)               # [B, B, V]
-    XC_self = (X * centers_f[:, None, :]).sum(-1)                 # [B, V]
-    proj_top  = XC_self[:, None, :] - XC                          # [B, B, V]
-    proj_bot  = XC.permute(1, 0, 2) - XC_self[None, :, :]        # [B, B, V]
-    proj_full = torch.cat([proj_top, proj_bot], dim=2)            # [B, B, 2V]
+    # Pairwise center differences and their projections onto each cluster's views
+    diff      = centers_f[:, None] - centers_f[None, :]          # [B, B, O]
+    proj_top  = torch.einsum('ivd,ijd->ijv', X, diff)            # [B, B, V]
+    proj_bot  = torch.einsum('jvd,ijd->ijv', X, diff)            # [B, B, V]
+    proj_full = torch.cat([proj_top, proj_bot], dim=2)           # [B, B, 2V]
 
     # Eigendecomposition of symmetric PSD gram matrices (stable for PSD inputs)
     # eigvals: [B*B, 2V] (ascending), eigvecs: [B*B, 2V, 2V] (columns = eigenvectors)

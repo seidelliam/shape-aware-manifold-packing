@@ -250,7 +250,7 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     device = centers.device
     dtype = centers.dtype
 
-    # Cast to float32: linalg.solve is numerically unstable in fp16/bf16
+    # Cast to float32: eigh/matmul are numerically unstable in fp16/bf16
     X = preds_T.float() * float(scale)  # [B, V, O]
     centers_f = centers.float()         # [B, O]
 
@@ -271,19 +271,24 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     gram_full = gram_full + reg * torch.eye(2 * V, device=device, dtype=torch.float32)
 
     # Pairwise center differences and their projections onto each cluster's views
-    diff     = centers_f[:, None] - centers_f[None, :]           # [B, B, O]
-    proj_top = torch.einsum('ivd,ijd->ijv', X, diff)             # [B, B, V]
-    proj_bot = torch.einsum('jvd,ijd->ijv', X, diff)             # [B, B, V]
+    diff      = centers_f[:, None] - centers_f[None, :]          # [B, B, O]
+    proj_top  = torch.einsum('ivd,ijd->ijv', X, diff)            # [B, B, V]
+    proj_bot  = torch.einsum('jvd,ijd->ijv', X, diff)            # [B, B, V]
     proj_full = torch.cat([proj_top, proj_bot], dim=2)           # [B, B, 2V]
 
-    # Batched solve: gram_full @ u = proj_full  (B² independent 2V×2V systems)
-    u = torch.linalg.solve(
-        gram_full.reshape(B * B, 2 * V, 2 * V),
-        proj_full.reshape(B * B, 2 * V, 1)
-    ).reshape(B, B, 2 * V)                                       # [B, B, 2V]
+    # Eigendecomposition of symmetric PSD gram matrices (stable for PSD inputs)
+    # eigvals: [B*B, 2V] (ascending), eigvecs: [B*B, 2V, 2V] (columns = eigenvectors)
+    gram_flat = gram_full.reshape(B * B, 2 * V, 2 * V)
+    eigvals, eigvecs = torch.linalg.eigh(gram_flat)
 
-    # d²[i,j] = proj · u  — cast result back to original dtype
-    d2 = (proj_full * u).sum(dim=-1)                             # [B, B]
+    # Project each diff-vector onto eigenbasis:  coords[n,k] = eigvec_k · proj[n]
+    proj_flat = proj_full.reshape(B * B, 2 * V)                  # [B*B, 2V]
+    coords = torch.bmm(eigvecs.mT, proj_flat.unsqueeze(-1)).squeeze(-1)  # [B*B, 2V]
+
+    # Mahalanobis²: d²=Σ_k (coords_k / λ_k)² = proj^T gram^{-2} proj
+    # (correctly accounts for both orientation and scale of each eigendirection)
+    d2 = (coords / eigvals.clamp(min=reg)).pow(2).sum(dim=-1).reshape(B, B)
+
     return torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12).to(dtype)  # [B, B]
 
 

@@ -365,9 +365,13 @@ def train_clamp(model:pl.LightningModule, train_loader: torch.utils.data.DataLoa
     else:
         # continue training
         ckpt_files = get_top_n_latest_checkpoints(checkpoint_path,1)
+        last_ckpt_path = os.path.join(checkpoint_path, 'last.ckpt')
         if ckpt_files:
             print("loading ...." + ckpt_files[0])
             trainer.fit(model, train_loader,val_loader,ckpt_path=ckpt_files[0])
+        elif os.path.isfile(last_ckpt_path):
+            print("loading ...." + last_ckpt_path)
+            trainer.fit(model, train_loader,val_loader,ckpt_path=last_ckpt_path)
         else:
             trainer.fit(model, train_loader,val_loader)
          # Load last checkpoint after training(best val_acc is just a reference do not load best val_acc here)

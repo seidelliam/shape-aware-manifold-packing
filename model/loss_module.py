@@ -250,44 +250,45 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     device = centers.device
     dtype = centers.dtype
 
-    # Cast to float32: eigh/matmul are numerically unstable in fp16/bf16
+    # Cast to float32: solve/matmul are numerically unstable in fp16/bf16
     X = preds_T.float() * float(scale)  # [B, V, O]
     centers_f = centers.float()         # [B, O]
 
     # All pairwise gram sub-blocks via a single flat matmul [B*V, O] @ [O, B*V]
     X_flat = X.reshape(B * V, O)
     cross_flat = X_flat @ X_flat.T                               # [B*V, B*V]
-    # Reshape to [B, B, V, V]:  cross[i,j,k,l] = sum_d X[i,k,d]*X[j,l,d]
     cross = cross_flat.reshape(B, V, B, V).permute(0, 2, 1, 3)  # [B, B, V, V]
-    # Per-cluster self-grams: gram_self[i] = cross[i,i]
+    del cross_flat
     gram_self = cross.diagonal(dim1=0, dim2=1).permute(2, 0, 1) # [B, V, V]
 
-    # Assemble 2V×2V block gram for every pair: [[Gi, Gij],[Gij^T, Gj]]
-    gram_i   = gram_self[:, None].expand(B, B, V, V)            # [B, B, V, V]
-    gram_j   = gram_self[None, :].expand(B, B, V, V)            # [B, B, V, V]
-    gram_top = torch.cat([gram_i,                  cross       ], dim=3)  # [B, B, V, 2V]
-    gram_bot = torch.cat([cross.transpose(-1, -2), gram_j      ], dim=3)  # [B, B, V, 2V]
-    gram_full = torch.cat([gram_top, gram_bot], dim=2)           # [B, B, 2V, 2V]
-    gram_full = gram_full + reg * torch.eye(2 * V, device=device, dtype=torch.float32)
+    # Assemble 2V×2V block gram in-place to avoid gram_top/gram_bot temporaries
+    gram_full = torch.zeros(B, B, 2 * V, 2 * V, device=device, dtype=torch.float32)
+    gram_full[:, :, :V, :V] = gram_self[:, None]   # Gi blocks
+    gram_full[:, :, V:, V:] = gram_self[None, :]   # Gj blocks
+    gram_full[:, :, :V, V:] = cross                # Gij blocks
+    gram_full[:, :, V:, :V] = cross.transpose(-1, -2)  # Gij^T blocks
+    del cross, gram_self
+    gram_full.diagonal(dim1=-2, dim2=-1).add_(reg)  # add reg*I in-place
 
-    # Pairwise center differences and their projections onto each cluster's views
-    diff      = centers_f[:, None] - centers_f[None, :]          # [B, B, O]
-    proj_top  = torch.einsum('ivd,ijd->ijv', X, diff)            # [B, B, V]
-    proj_bot  = torch.einsum('jvd,ijd->ijv', X, diff)            # [B, B, V]
-    proj_full = torch.cat([proj_top, proj_bot], dim=2)           # [B, B, 2V]
+    # Pairwise center-difference projections without materializing [B, B, O] diff.
+    # XC[i,j,v] = sum_d X[i,v,d] * c[j,d]  →  [B, B, V]
+    XC = torch.einsum('ivd,jd->ijv', X, centers_f)               # [B, B, V]
+    XC_self = (X * centers_f[:, None, :]).sum(-1)                 # [B, V]
+    proj_top  = XC_self[:, None, :] - XC                          # [B, B, V]
+    proj_bot  = XC.permute(1, 0, 2) - XC_self[None, :, :]        # [B, B, V]
+    proj_full = torch.cat([proj_top, proj_bot], dim=2)            # [B, B, 2V]
+    del XC, XC_self, proj_top, proj_bot
 
-    # Eigendecomposition of symmetric PSD gram matrices (stable for PSD inputs)
-    # eigvals: [B*B, 2V] (ascending), eigvecs: [B*B, 2V, 2V] (columns = eigenvectors)
+    # Solve gram @ y = proj  →  y = gram^{-1} proj
+    # d² = ||y||² = proj^T gram^{-2} proj  (same as eigh formulation but avoids
+    # storing [B*B, 2V, 2V] eigenvectors, which dominates memory at large V)
     gram_flat = gram_full.reshape(B * B, 2 * V, 2 * V)
-    eigvals, eigvecs = torch.linalg.eigh(gram_flat)
-
-    # Project each diff-vector onto eigenbasis:  coords[n,k] = eigvec_k · proj[n]
-    proj_flat = proj_full.reshape(B * B, 2 * V)                  # [B*B, 2V]
-    coords = torch.bmm(eigvecs.mT, proj_flat.unsqueeze(-1)).squeeze(-1)  # [B*B, 2V]
-
-    # Mahalanobis²: d²=Σ_k (coords_k / λ_k)² = proj^T gram^{-2} proj
-    # (correctly accounts for both orientation and scale of each eigendirection)
-    d2 = (coords / eigvals.clamp(min=reg)).pow(2).sum(dim=-1).reshape(B, B)
+    del gram_full
+    proj_flat = proj_full.reshape(B * B, 2 * V)
+    del proj_full
+    y = torch.linalg.solve(gram_flat, proj_flat.unsqueeze(-1)).squeeze(-1)  # [B*B, 2V]
+    del gram_flat, proj_flat
+    d2 = (y * y).sum(dim=-1).reshape(B, B)
 
     return torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12).to(dtype)  # [B, B]
 

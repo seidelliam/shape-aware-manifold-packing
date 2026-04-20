@@ -354,8 +354,9 @@ def train_clamp(model:pl.LightningModule, train_loader: torch.utils.data.DataLoa
                                                                   dirpath=checkpoint_path,
                                                                   filename = "ssl-{epoch:d}"),
                                     pl.callbacks.LearningRateMonitor('epoch')],
-                         profiler="simple" if if_profile else None)
-    trainer.logger._default_hp_metric = False 
+                         profiler="simple" if if_profile else None,
+                         num_sanity_val_steps=0)
+    trainer.logger._default_hp_metric = False
     # Check whether pretrained model exists and finished. If yes, load it and skip training
     last_ckpt = os.path.join(checkpoint_path,'ssl-epoch={:d}.ckpt'.format(max_epochs-1))
     if os.path.isfile(last_ckpt):

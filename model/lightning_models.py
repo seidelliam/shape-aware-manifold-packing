@@ -174,7 +174,8 @@ class CLAMP(pl.LightningModule):
         self.log_histogram()
         return loss
     def on_train_epoch_end(self):
-        # measure the norm of the gradient
+        if not self.train_step_outputs:
+            return
         avg_loss = torch.stack([x for x in self.train_step_outputs]).mean()  # Compute the average loss for the epoch
         self.log('train_epoch_loss', avg_loss, prog_bar=True,sync_dist=True)  # Log epoch loss
         #self.log('grad_norm', total_norm, prog_bar=True,sync_dist=True) 
@@ -286,7 +287,9 @@ class CLAMP(pl.LightningModule):
         return acc
     
     def on_validation_epoch_end(self):
-        val_radius =  torch.stack([x["val_radius"] for x in self.val_step_outputs]).mean() 
+        if not self.val_step_outputs:
+            return
+        val_radius =  torch.stack([x["val_radius"] for x in self.val_step_outputs]).mean()
         val_activity = torch.stack([x["val_activity"] for x in self.val_step_outputs]).mean()
         val_num_nbr = torch.stack([x["val_num_nbr"] for x in self.val_step_outputs]).mean()
         val_acc = torch.stack([x["val_acc"] for x in self.val_step_outputs]).mean()

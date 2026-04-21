@@ -240,7 +240,7 @@ class CLAMP(pl.LightningModule):
         std = torch.sqrt(torch.sum(preds*preds,dim=(0,1))/(preds.shape[0]*preds.shape[1] - 1.0) + 1e-12)
         if "StdNorm" in self.hparams.loss_name:
             preds = preds/std
-        elif "UnitNorm" in self.hparams.loss_name:
+        elif "UnitNorm" in self.hparams.loss_name or "Anisotropic" in self.hparams.loss_name or "SAMP" in self.hparams.loss_name:
             preds = torch.nn.functional.normalize(preds,dim=-1)
         elif "MMCR" in self.hparams.loss_name:
             preds = torch.nn.functional.normalize(preds,dim=-1)

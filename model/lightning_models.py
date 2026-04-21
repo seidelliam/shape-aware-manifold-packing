@@ -186,32 +186,27 @@ class CLAMP(pl.LightningModule):
         gc.collect()
         torch.cuda.empty_cache()
     def on_after_backward(self):
-        # Calculate the total gradient norm for all parameters
-        convnet_norm = 0.0
-        convnet_grad_norm = 0.0
-        head_norm = 0.0
-        head_grad_norm = 0.0
-        for p in self.backbone.net.parameters():
-            if p.grad is not None:
-                # Calculate the norm for each parameter
-                param_norm = p.data.norm(2)
-                grad_norm = p.grad.data.norm(2)
-                convnet_grad_norm += grad_norm.item() ** 2
-                convnet_norm += param_norm.item()**2
-        
-        for p in self.backbone.projection_head.parameters():
-            if p.grad is not None:
-                # Calculate the norm for each parameter
-                param_norm = p.data.norm(2)
-                grad_norm = p.grad.data.norm(2)
-                head_grad_norm += grad_norm.item() ** 2
-                head_norm += param_norm.item()**2
+        # Only log every 50 steps — norm logging is diagnostic, not per-step critical.
+        # The original code called .item() per parameter (~140+ GPU-CPU syncs/step).
+        if self.global_step % 50 != 0:
+            return
+        def _vec_norm(params, use_grad: bool) -> float:
+            # Accumulate squared norms on GPU, one .item() sync at the end.
+            sq = None
+            for p in params:
+                t = p.grad if use_grad else p.data
+                if t is None:
+                    continue
+                n2 = t.detach().norm(2).pow(2)
+                sq = n2 if sq is None else sq + n2
+            return sq.sqrt().item() if sq is not None else 0.0
 
-        convnet_grad_norm = convnet_grad_norm ** 0.5
-        convnet_norm = convnet_norm ** 0.5
-        head_grad_norm = head_grad_norm ** 0.5
-        head_norm = head_norm ** 0.5
-        # Log the gradient norm; this can be viewed in TensorBoard or your logger
+        convnet_params = list(self.backbone.net.parameters())
+        head_params    = list(self.backbone.projection_head.parameters())
+        convnet_grad_norm = _vec_norm(convnet_params, use_grad=True)
+        convnet_norm      = _vec_norm(convnet_params, use_grad=False)
+        head_grad_norm    = _vec_norm(head_params,    use_grad=True)
+        head_norm         = _vec_norm(head_params,    use_grad=False)
         self.log('convnet_grad_norm', convnet_grad_norm, prog_bar=False)
         self.log('convnet_param_norm', convnet_norm, prog_bar=False)
         self.log('head_grad_norm', head_grad_norm, prog_bar=False)

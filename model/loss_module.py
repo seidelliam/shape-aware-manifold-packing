@@ -239,39 +239,49 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     """Fully-vectorized pairwise Mahalanobis distance matrix.
 
     Args:
-        centers:  [B, O] cluster centroids
+        centers:  [B, O] cluster centroids (gradient flows through this)
         preds_T:  [B, V, O] zero-mean view embeddings per cluster
         scale:    float, typically 1/sqrt(V-1)
         reg:      diagonal regularization added to each gram matrix
     Returns:
         dist_matrix: [B, B] symmetric distance matrix
+
+    Gradient notes: gram matrices are detached from autograd — gradients flow
+    only through center differences (proj_full). This avoids expensive backprop
+    through torch.linalg.solve while preserving the primary gradient signal.
     """
     B, V, O = preds_T.shape
     device = centers.device
     dtype = centers.dtype
 
-    # Cast to float32: solve/matmul are numerically unstable in fp16/bf16
-    X = preds_T.float() * float(scale)  # [B, V, O]
-    centers_f = centers.float()         # [B, O]
+    # Detach preds for gram construction: no gradient through the metric tensor.
+    # Gradient flows through center differences (proj_full) only.
+    X = preds_T.detach().float() * float(scale)  # [B, V, O]
+    centers_f = centers.float()                   # [B, O] — keeps gradient
 
-    # All pairwise gram sub-blocks via a single flat matmul [B*V, O] @ [O, B*V]
-    X_flat = X.reshape(B * V, O)
-    cross_flat = X_flat @ X_flat.T                               # [B*V, B*V]
-    cross = cross_flat.reshape(B, V, B, V).permute(0, 2, 1, 3)  # [B, B, V, V]
-    del cross_flat
-    gram_self = cross.diagonal(dim1=0, dim2=1).permute(2, 0, 1) # [B, V, V]
+    # Build gram matrices under no_grad: Cholesky factorization is cheaper than LU.
+    with torch.no_grad():
+        X_flat = X.reshape(B * V, O)
+        cross_flat = X_flat @ X_flat.T                               # [B*V, B*V]
+        cross = cross_flat.reshape(B, V, B, V).permute(0, 2, 1, 3)  # [B, B, V, V]
+        del cross_flat
+        gram_self = cross.diagonal(dim1=0, dim2=1).permute(2, 0, 1) # [B, V, V]
 
-    # Assemble 2V×2V block gram in-place to avoid gram_top/gram_bot temporaries
-    gram_full = torch.zeros(B, B, 2 * V, 2 * V, device=device, dtype=torch.float32)
-    gram_full[:, :, :V, :V] = gram_self[:, None]   # Gi blocks
-    gram_full[:, :, V:, V:] = gram_self[None, :]   # Gj blocks
-    gram_full[:, :, :V, V:] = cross                # Gij blocks
-    gram_full[:, :, V:, :V] = cross.transpose(-1, -2)  # Gij^T blocks
-    del cross, gram_self
-    gram_full.diagonal(dim1=-2, dim2=-1).add_(reg)  # add reg*I in-place
+        gram_full = torch.zeros(B, B, 2 * V, 2 * V, device=device, dtype=torch.float32)
+        gram_full[:, :, :V, :V] = gram_self[:, None]
+        gram_full[:, :, V:, V:] = gram_self[None, :]
+        gram_full[:, :, :V, V:] = cross
+        gram_full[:, :, V:, :V] = cross.transpose(-1, -2)
+        del cross, gram_self
+        gram_full.diagonal(dim1=-2, dim2=-1).add_(reg)
+        gram_flat = gram_full.reshape(B * B, 2 * V, 2 * V)
+        del gram_full
+        # Cholesky is ~2x faster than LU for symmetric PD matrices.
+        # d² = ||L^{-1} proj||² since gram = L L^T → gram^{-1} = L^{-T} L^{-1}
+        L = torch.linalg.cholesky(gram_flat)
+        del gram_flat
 
-    # Pairwise center-difference projections without materializing [B, B, O] diff.
-    # XC[i,j,v] = sum_d X[i,v,d] * c[j,d]  →  [B, B, V]
+    # proj_full encodes center differences — gradient flows through centers_f here.
     XC = torch.einsum('ivd,jd->ijv', X, centers_f)               # [B, B, V]
     XC_self = (X * centers_f[:, None, :]).sum(-1)                 # [B, V]
     proj_top  = XC_self[:, None, :] - XC                          # [B, B, V]
@@ -279,16 +289,15 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
     proj_full = torch.cat([proj_top, proj_bot], dim=2)            # [B, B, 2V]
     del XC, XC_self, proj_top, proj_bot
 
-    # Solve gram @ y = proj  →  y = gram^{-1} proj
-    # d² = ||y||² = proj^T gram^{-2} proj  (same as eigh formulation but avoids
-    # storing [B*B, 2V, 2V] eigenvectors, which dominates memory at large V)
-    gram_flat = gram_full.reshape(B * B, 2 * V, 2 * V)
-    del gram_full
-    proj_flat = proj_full.reshape(B * B, 2 * V)
+    proj_flat = proj_full.reshape(B * B, 2 * V, 1)
     del proj_full
-    y = torch.linalg.solve(gram_flat, proj_flat.unsqueeze(-1)).squeeze(-1)  # [B*B, 2V]
-    del gram_flat, proj_flat
-    d2 = (y * y).sum(dim=-1).reshape(B, B)
+
+    # One triangular solve: y = L^{-1} proj, d² = ||y||²
+    # L is detached; gradient of d² w.r.t. proj_flat = 2 L^{-T} L^{-1} proj = 2 gram^{-1} proj
+    y = torch.linalg.solve_triangular(L, proj_flat, upper=False)  # [B*B, 2V, 1]
+    del L, proj_flat
+    d2 = y.squeeze(-1).pow(2).sum(-1).reshape(B, B)
+    del y
 
     return torch.sqrt(torch.clamp(d2, min=0.0) + 1e-12).to(dtype)  # [B, B]
 
@@ -403,8 +412,11 @@ class SAMPLoss(AnisotropicLogRepulsiveEllipsoidPackingLoss):
         preds_T = preds.permute(1, 0, 2)  # [B_total, V, O]
 
         # Batched SVD for per-cluster principal directions: [B_total, V, O]
-        _, _, Vh = torch.linalg.svd(preds_T, full_matrices=False)
-        eigvecs = Vh.permute(0, 2, 1)  # [B_total, O, V]
+        # Detach: eigvecs are used as constants in GradientAttenuator.backward,
+        # not as differentiable quantities. This avoids expensive SVD backprop.
+        with torch.no_grad():
+            _, _, Vh = torch.linalg.svd(preds_T, full_matrices=False)
+        eigvecs = Vh.permute(0, 2, 1).detach()  # [B_total, O, V]
 
         # Apply gradient attenuation to centers (identity forward, attenuates backward)
         centers_att = GradientAttenuator.apply(centers, eigvecs, self.gamma)

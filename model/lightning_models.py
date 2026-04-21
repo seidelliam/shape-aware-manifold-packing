@@ -176,7 +176,11 @@ class CLAMP(pl.LightningModule):
     def on_train_epoch_end(self):
         if not self.train_step_outputs:
             return
-        avg_loss = torch.stack([x for x in self.train_step_outputs]).mean()  # Compute the average loss for the epoch
+        valid = [x for x in self.train_step_outputs if not torch.isnan(x)]
+        if not valid:
+            self.train_step_outputs = []
+            return
+        avg_loss = torch.stack(valid).mean()
         self.log('train_epoch_loss', avg_loss, prog_bar=True,sync_dist=True)  # Log epoch loss
         #self.log('grad_norm', total_norm, prog_bar=True,sync_dist=True) 
         # refresh the iteration loss at the end of every epoch

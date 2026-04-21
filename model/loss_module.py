@@ -235,7 +235,7 @@ class GradientAttenuator(torch.autograd.Function):
 # where  gram_ij = [Xi;Xj][Xi;Xj]^T  (2V×2V)  and  proj_ij = [Xi;Xj](ci-cj).
 # All operations are batched over B² pairs using torch.linalg.solve.
 # ---------------------------------------------------------------------------
-def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-3):
+def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-2):
     """Fully-vectorized pairwise Mahalanobis distance matrix.
 
     Args:
@@ -280,6 +280,12 @@ def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-3):
         # d² = ||L^{-1} proj||² since gram = L L^T → gram^{-1} = L^{-T} L^{-1}
         L = torch.linalg.cholesky(gram_flat)
         del gram_flat
+        # For near-singular pairs where Cholesky fails, fall back to identity
+        # (equivalent to Euclidean distance for that pair, avoids NaN gradients).
+        # 0/NaN = NaN in sqrt backward even when the masked loss contribution is 0.
+        bad = torch.isnan(L).any(dim=-1).any(dim=-1)  # [B*B]
+        if bad.any():
+            L[bad] = torch.eye(2 * V, device=device, dtype=torch.float32)
 
     # proj_full encodes center differences — gradient flows through centers_f here.
     XC = torch.einsum('ivd,jd->ijv', X, centers_f)               # [B, B, V]
@@ -352,7 +358,8 @@ class AnisotropicLogRepulsiveEllipsoidPackingLoss(LogRepulsiveEllipsoidPackingLo
         self_mask = torch.eye(B_total, dtype=bool, device=preds.device)
         mask = torch.logical_and(nbr_mask, torch.logical_not(self_mask))
         ll = 0.5 * ((1.0 - dist_matrix[mask] / sum_radii[mask]) ** self.pot_pow).sum() * self.lw1
-        ll += self.lw0 * torch.sum(radii)
+        if abs(self.lw0) > 1e-6:
+            ll += self.lw0 * torch.sum(radii)
         self.record["radii"] = radii.detach()
         self.record["dist"] = dist_matrix[torch.logical_not(self_mask)].reshape((-1,)).detach()
         self.record["norm_center"] = torch.linalg.norm(centers, dim=-1).detach()
@@ -429,7 +436,8 @@ class SAMPLoss(AnisotropicLogRepulsiveEllipsoidPackingLoss):
         self_mask = torch.eye(B_total, dtype=bool, device=preds.device)
         mask = torch.logical_and(nbr_mask, torch.logical_not(self_mask))
         ll = 0.5 * ((1.0 - dist_matrix[mask] / sum_radii[mask]) ** self.pot_pow).sum() * self.lw1
-        ll += self.lw0 * torch.sum(radii)
+        if abs(self.lw0) > 1e-6:
+            ll += self.lw0 * torch.sum(radii)
         self.record["radii"] = radii.detach()
         self.record["dist"] = dist_matrix[torch.logical_not(self_mask)].reshape((-1,)).detach()
         self.record["norm_center"] = torch.linalg.norm(centers, dim=-1).detach()

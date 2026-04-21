@@ -235,7 +235,7 @@ class GradientAttenuator(torch.autograd.Function):
 # where  gram_ij = [Xi;Xj][Xi;Xj]^T  (2V×2V)  and  proj_ij = [Xi;Xj](ci-cj).
 # All operations are batched over B² pairs using torch.linalg.solve.
 # ---------------------------------------------------------------------------
-def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-4):
+def _mahalanobis_dist_matrix(centers, preds_T, scale, reg=1e-3):
     """Fully-vectorized pairwise Mahalanobis distance matrix.
 
     Args:

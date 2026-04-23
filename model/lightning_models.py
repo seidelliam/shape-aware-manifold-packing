@@ -351,6 +351,7 @@ def train_clamp(model:pl.LightningModule, train_loader: torch.utils.data.DataLoa
                          precision=precision,
                          strategy=effective_strategy,
                          max_epochs=max_epochs,
+                         gradient_clip_val=1.0,
                          check_val_every_n_epoch=5,
                          callbacks=[pl.callbacks.ModelCheckpoint(save_top_k = -1,
                                                                   save_last = True,

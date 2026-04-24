@@ -2,7 +2,7 @@
 
 Shape-Aware Manifold Packing — CS 652 Project  
 Run all experiments from the repo root: `~/clamp/` (or wherever you cloned the repo).
-
+Look to Research Paper for information on topic
 ---
 
 ## 1. One-Time Setup

@@ -115,7 +115,7 @@ Run after pretraining completes for each experiment:
 
 ```bash
 python linear_probe.py examples/cifar100-baseline default_configs/default_config_cifar10.ini
-python linear_probe.py examples/cifar100-anisotropic default_configs/default_config_cifar10.ini
+default_configs/default_config_cifar10.ini
 python linear_probe.py examples/cifar100-samp-g0 default_configs/default_config_cifar10.ini
 python linear_probe.py examples/cifar100-samp-g025 default_configs/default_config_cifar10.ini
 python linear_probe.py examples/cifar100-samp-g050 default_configs/default_config_cifar10.ini

@@ -48,7 +48,6 @@ if not hasattr(cv2, "multiply"):
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import urllib.request
-import os
 # this dataset loads images into numpy array format
 # the default dataset loads images into PIL format
 # credit to

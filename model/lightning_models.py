@@ -28,7 +28,6 @@ MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
 
 def start_record_memory_history() -> None:
    if not torch.cuda.is_available():
-       print("CUDA unavailable. Not recording memory history")
        raise ValueError("CUDA unavailable. Not recording memory history")
    torch.cuda.memory._record_memory_history(
        max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
@@ -36,13 +35,11 @@ def start_record_memory_history() -> None:
 
 def stop_record_memory_history() -> None:
     if not torch.cuda.is_available():
-       print("CUDA unavailable. Not recording memory history")
        raise ValueError("CUDA unavailable. Not recording memory history")
     torch.cuda.memory._record_memory_history(enabled=None)
 
 def export_memory_snapshot(file_path:str) -> None:
    if not torch.cuda.is_available():
-       print("CUDA unavailable. Not recording memory history")
        raise ValueError("CUDA unavailable. Not recording memory history")
    try:
        print(f"Saving snapshot to local file:" + file_path )

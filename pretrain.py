@@ -2,7 +2,6 @@ import sys
 from utils import data_utils
 import helper
 import matplotlib.pyplot as plt
-from utils import data_utils
 import torch
 from model import models
 import os
@@ -26,13 +25,10 @@ if __name__ == '__main__':
         print("CUDA not available — training will use CPU.")
     # save the starting time as the last line of file staring-time.txt
     current_datetime,zone = helper.get_est_time_now()
-    if os.path.isfile(os.path.join(input_dir,"starting-time.txt")):
-        with open(os.path.join(input_dir,"starting-time.txt"),"a") as f:
+    with open(os.path.join(input_dir,"starting-time.txt"),"a") as f:
+        if os.path.getsize(os.path.join(input_dir,"starting-time.txt")) > 0:
             f.write("\n")
-            f.write(current_datetime.strftime("%Y-%m-%d %H:%M:%S"))
-    else:
-        with open(os.path.join(input_dir,"starting-time.txt"),"a") as f:
-            f.write(current_datetime.strftime("%Y-%m-%d %H:%M:%S"))
+        f.write(current_datetime.strftime("%Y-%m-%d %H:%M:%S"))
 
     ###################################################
     # self-superivesed learning
